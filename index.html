@@ -86,29 +86,28 @@ const defaultSave = () => ({
 });
 let save = defaultSave();
 
-async function loadSave() {
+function loadSave() {
   try {
-    if (window.storage && window.storage.get) {
-      const r = await window.storage.get(SAVE_KEY);
-      if (r && r.value) save = Object.assign(defaultSave(), JSON.parse(r.value));
-    }
+    const raw = localStorage.getItem(SAVE_KEY);
+    if (raw) save = Object.assign(defaultSave(), JSON.parse(raw));
   } catch (e) { /* fresh save */ }
   applyMuteUI();
 }
-async function persist() {
+function persist() {
   try {
-    if (window.storage && window.storage.set) {
-      await window.storage.set(SAVE_KEY, JSON.stringify(save));
-    }
+    localStorage.setItem(SAVE_KEY, JSON.stringify(save));
   } catch (e) {}
 }
+
+// Audio handles - declared early so applyMuteUI (called from loadSave) can reference them
+let audioCtx = null;
+let musicGain = null, sfxGain = null;
+
 loadSave();
 
 // =====================================================================
 // Audio (Web Audio synthesis — no asset files needed)
 // =====================================================================
-let audioCtx = null;
-let musicGain = null, sfxGain = null;
 function ensureAudio() {
   if (audioCtx) return;
   try {
@@ -340,21 +339,57 @@ function grassRow(rowIdx, r) {
   const decor = [];
   const blockers = new Set();
   const playfieldCols = COLS;
-  const treeChance = Math.min(0.32, 0.15 + rowIdx*0.001);
-  for (let c = 0; c < playfieldCols; c++) {
-    if (r() < treeChance && playfieldCols > 5) {
-      // never block all paths: cap at COLS-3 trees
-      if (blockers.size < playfieldCols - 3) {
-        decor.push({ kind:'tree', col:c, h: 0.8 + r()*0.5, seed: r() });
-        blockers.add(c);
-        continue;
+  const baseChance = Math.min(0.32, 0.16 + rowIdx*0.0008);
+  const maxTrees = Math.max(1, Math.floor(playfieldCols * 0.45));
+
+  // Shuffle col order so capped trees aren't biased to the left side
+  const colOrder = [];
+  for (let c = 0; c < playfieldCols; c++) colOrder.push(c);
+  for (let i = colOrder.length - 1; i > 0; i--) {
+    const j = Math.floor(r() * (i + 1));
+    [colOrder[i], colOrder[j]] = [colOrder[j], colOrder[i]];
+  }
+
+  // Pass 1: place trees one at a time. Undo any placement that would
+  // strand an open column with blocked neighbors on both sides.
+  for (const c of colOrder) {
+    if (blockers.size >= maxTrees) break;
+    if (r() >= baseChance) continue;
+    blockers.add(c);
+    if (!isSolvableRow(blockers, playfieldCols)) blockers.delete(c);
+  }
+
+  // Pass 2: ensure connectivity from the previous grass row's open columns.
+  // From every prev-open col, the player must be able to advance via either
+  // a direct forward hop or a single sidestep on the prev row.
+  const prev = game.rows.get(rowIdx - 1);
+  if (prev && prev.type === LANE.GRASS && prev.blockers) {
+    const prevOpen = [];
+    for (let c = 0; c < playfieldCols; c++) if (!prev.blockers.has(c)) prevOpen.push(c);
+    for (const P of prevOpen) {
+      if (canAdvanceFrom(P, prev.blockers, blockers, playfieldCols)) continue;
+      // Free a path by removing the tree most likely to help: P, then P+1, then P-1
+      const tries = [P, P+1, P-1].filter(c => c >= 0 && c < playfieldCols && blockers.has(c));
+      for (const t of tries) {
+        blockers.delete(t);
+        if (canAdvanceFrom(P, prev.blockers, blockers, playfieldCols)) break;
+        blockers.add(t);
       }
     }
+  }
+
+  // Build decor
+  for (const c of blockers) {
+    decor.push({ kind:'tree', col:c, h: 0.8 + r()*0.5, seed: r() });
+  }
+  for (let c = 0; c < playfieldCols; c++) {
+    if (blockers.has(c)) continue;
     const dr = r();
     if (dr < 0.06) decor.push({ kind:'bush', col:c, seed:r() });
     else if (dr < 0.09) decor.push({ kind:'mushroom', col:c, seed:r() });
     else if (dr < 0.105) decor.push({ kind:'rock', col:c, seed:r() });
   }
+
   // coins on grass (avoiding tree tiles)
   const coins = new Set();
   for (let c = 0; c < playfieldCols; c++) {
@@ -362,6 +397,32 @@ function grassRow(rowIdx, r) {
     if (r() < 0.08 + Math.min(0.18, rowIdx*0.0008)) coins.add(c);
   }
   return { type: LANE.GRASS, rowIdx, decor, blockers, coins };
+}
+
+// True iff every open col on the row has at least one open neighbor (or edge
+// counts as a wall). Prevents stranded single tiles between two trees.
+function isSolvableRow(blockers, cols) {
+  let openCount = 0;
+  for (let c = 0; c < cols; c++) {
+    if (blockers.has(c)) continue;
+    openCount++;
+    const leftBlocked  = c === 0        || blockers.has(c - 1);
+    const rightBlocked = c === cols - 1 || blockers.has(c + 1);
+    if (leftBlocked && rightBlocked) return false;
+  }
+  return openCount > 0;
+}
+
+// True iff a player at col P on the previous row can reach this row by either
+// hopping forward (col P open here) or sidestepping once on the prev row to
+// an adjacent col that's open on both rows.
+function canAdvanceFrom(P, prevBlockers, thisBlockers, cols) {
+  if (!thisBlockers.has(P)) return true;
+  for (const sc of [P - 1, P + 1]) {
+    if (sc < 0 || sc >= cols) continue;
+    if (!prevBlockers.has(sc) && !thisBlockers.has(sc)) return true;
+  }
+  return false;
 }
 
 function roadRow(rowIdx, r, speedMult) {
@@ -707,22 +768,11 @@ function update(dt) {
         }
       } else if (lane.type === LANE.RIVER) {
         if (!p.onLog && p.hopT <= 0) {
-          // try to attach
+          // Attach if the player tile center sits over any log
           let attached = null;
           for (const lg of lane.logs) {
-            if (p.x + 0.45 > lg.x - lg.w/2 && p.x + 0.55 < lg.x + lg.w/2 + 1) {
-              // simpler: closest log within range
-              if (p.x >= lg.x - lg.w/2 - 0.1 && p.x <= lg.x + lg.w/2 + 0.1) {
-                attached = lg; break;
-              }
-            }
-          }
-          // robust attach: any log overlapping player col center
-          if (!attached) {
-            for (const lg of lane.logs) {
-              const a = lg.x - lg.w/2, b = lg.x + lg.w/2;
-              if (p.x + 0.5 >= a && p.x + 0.5 <= b) { attached = lg; break; }
-            }
+            const a = lg.x - lg.w/2, b = lg.x + lg.w/2;
+            if (p.x + 0.5 >= a && p.x + 0.5 <= b) { attached = lg; break; }
           }
           if (attached) {
             p.onLog = { log: attached, offset: p.x - attached.x };
@@ -734,13 +784,13 @@ function update(dt) {
             }
             sfx.logHop();
           } else {
-            // falling in water
+            // First frame in water: splash
+            if (p.swimT === 0) sfx.splash();
             p.swimT += dt;
-            // splash particles
-            if (Math.random() < 8 * dt) {
+            if (Math.random() < 12 * dt) {
               game.particles.push({kind:'splash', x: p.x+0.5, y: p.y+0.5, vx:(Math.random()-0.5)*2, vy:-Math.random()*2-1, life:0.5, max:0.5});
             }
-            if (p.swimT >= 2.0) killPlayer('splash');
+            if (p.swimT >= 0.45) killPlayer('splash');
           }
         }
       } else if (lane.type === LANE.TRACK) {
@@ -808,10 +858,9 @@ function onLand() {
   const p = game.player;
   p.idleT = 0;
   p.tailSlapT = 0;
-  // landing on road/track triggers immediate collision check next update
   const lane = game.rows.get(p.row);
-  if (lane && lane.type === LANE.RIVER) {
-    // need to check after; but let's also pick coin if landing on lily right away
+  if (!lane || lane.type !== LANE.RIVER) {
+    p.swimT = 0; // safe ground (or road/track) — clear any leftover water timer
   }
 }
 
