@@ -768,15 +768,19 @@ function update(dt) {
         }
       } else if (lane.type === LANE.RIVER) {
         if (!p.onLog && p.hopT <= 0) {
-          // Attach if the player tile center sits over any log
+          // Tile-width overlap: player tile spans [p.x, p.x+1]. Any log whose
+          // footprint overlaps that span by at least half a tile counts as
+          // a landing. This forgives the log having drifted during the hop.
+          const playerL = p.x + 0.15;
+          const playerR = p.x + 0.85;
           let attached = null;
           for (const lg of lane.logs) {
             const a = lg.x - lg.w/2, b = lg.x + lg.w/2;
-            if (p.x + 0.5 >= a && p.x + 0.5 <= b) { attached = lg; break; }
+            const overlap = Math.min(playerR, b) - Math.max(playerL, a);
+            if (overlap >= 0.35) { attached = lg; break; }
           }
           if (attached) {
             p.onLog = { log: attached, offset: p.x - attached.x };
-            p.swimT = 0;
             // pickup lily coin
             if (attached.hasCoin) {
               attached.hasCoin = false;
@@ -784,13 +788,11 @@ function update(dt) {
             }
             sfx.logHop();
           } else {
-            // First frame in water: splash
-            if (p.swimT === 0) sfx.splash();
-            p.swimT += dt;
-            if (Math.random() < 12 * dt) {
-              game.particles.push({kind:'splash', x: p.x+0.5, y: p.y+0.5, vx:(Math.random()-0.5)*2, vy:-Math.random()*2-1, life:0.5, max:0.5});
+            // No log under us - instant drown. Splash particles for flavor.
+            for (let i = 0; i < 6; i++) {
+              game.particles.push({kind:'splash', x: p.x+0.5, y: p.y+0.5, vx:(Math.random()-0.5)*3, vy:-Math.random()*3-1, life:0.6, max:0.6});
             }
-            if (p.swimT >= 0.45) killPlayer('splash');
+            killPlayer('splash');
           }
         }
       } else if (lane.type === LANE.TRACK) {
