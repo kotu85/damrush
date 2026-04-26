@@ -292,7 +292,10 @@ function rng(seed) {
 function pick(arr, r) { return arr[Math.floor(r()*arr.length)]; }
 
 function makeRow(rowIdx) {
-  const r = rng(rowIdx * 9301 + 49297);
+  // Lane-type RNG uses the per-run seed so the *sequence* of grass/road/river
+  // varies between runs. Within-row content (vehicle positions, log spawns,
+  // tree layout) uses the row-only RNG so it's deterministic per row index.
+  const r = rng(rowIdx * 9301 + 49297 + (game.runSeed || 0) * 7919);
   // First few rows: safe grass
   if (rowIdx <= 2) {
     return safeGrass(rowIdx, r);
@@ -427,16 +430,20 @@ function canAdvanceFrom(P, prevBlockers, thisBlockers, cols) {
 
 function roadRow(rowIdx, r, speedMult) {
   const dir = r() < 0.5 ? 1 : -1;
-  const baseSpeed = (1.2 + r()*1.6) * speedMult; // tiles per second
+  const baseSpeed = (1.2 + r()*1.6) * speedMult; // tiles/sec absolute
   const speed = baseSpeed * dir;
   const vehicles = [];
   const vehicleType = pick(['truck','atv','roller'], r);
-  // initial spawn
-  const gap = 2.5 + r()*3.5;
+  // Edge-to-edge gap. The player needs roughly 1 second of clear-tile time
+  // to spot the gap and hop across, so minimum gap (in tiles) must be at
+  // least baseSpeed * 1.0. Add room for variability on top.
+  const minGap = Math.max(3.0, baseSpeed * 1.1);
+  const gapRange = Math.max(2.5, baseSpeed * 0.8);
   let x = -2 + r()*COLS;
   while (x < COLS + 4) {
-    vehicles.push(makeVehicle(vehicleType, x, dir, r));
-    x += gap + r()*1.5;
+    const v = makeVehicle(vehicleType, x, dir, r);
+    vehicles.push(v);
+    x += v.w + minGap + r() * gapRange;
   }
   return { type: LANE.ROAD, rowIdx, speed, dir, vehicles, vehicleType };
 }
@@ -450,13 +457,20 @@ function makeVehicle(type, x, dir, r) {
 
 function riverRow(rowIdx, r, speedMult) {
   const dir = r() < 0.5 ? 1 : -1;
-  const speed = (0.7 + r()*1.1) * speedMult * dir;
+  // Speed range narrowed and floor raised so slow lanes don't strand you.
+  const baseSpeed = (1.0 + r()*0.9) * speedMult; // 1.0 to 1.9 tiles/sec base
+  const speed = baseSpeed * dir;
   const logs = [];
+  // Hard cap on gap between logs (edge-to-edge): never more than 3 tiles of
+  // open water. At slowest speed (1.0 t/s), that means at most 3 seconds
+  // of waiting. Eagle warning is at 4s so you always have time.
+  const minGap = 1.0;
+  const maxGap = 3.0;
   let x = -2 + r()*COLS;
   while (x < COLS + 4) {
-    const w = 2 + Math.floor(r()*3); // 2,3,4
+    const w = 2 + Math.floor(r()*3); // 2, 3, or 4 tiles wide
     logs.push({ x, w, hasLily: r() < 0.18, lilyOffset: 0.5 + r()*(w-1.0), lilyHasFlower: r()<0.4, hasCoin: r()<0.35 });
-    x += w + 1.2 + r()*2.5;
+    x += w + minGap + r() * (maxGap - minGap);
   }
   return { type: LANE.RIVER, rowIdx, speed, dir, logs };
 }
@@ -480,13 +494,14 @@ function ensureRows() {
 }
 
 function initWorld() {
+  game.runSeed = Math.floor(Math.random() * 1000000);
   game.rows.clear();
   game.startRow = -6;
   game.endRow = -1;
   for (let r = -6; r <= 5; r++) game.rows.set(r, safeGrass(r, rng(r)));
   game.endRow = 5;
   // a few procedural ones to start
-  for (let r = 6; r <= 18; r++) game.rows.set(r, makeRow(r)); 
+  for (let r = 6; r <= 18; r++) game.rows.set(r, makeRow(r));
   game.endRow = 18;
   game.particles.length = 0;
   game.pawprints.length = 0;
@@ -646,8 +661,13 @@ function update(dt) {
       // small ground ring
       game.particles.push({ kind:'ring', x: p.x+0.5, y: p.y+0.5, r:0.1, life:0.4, max:0.4 });
     }
+    if (p.idleT >= 4.0 && p.idleT < 4.1 && !game.eagle) {
+      // brief warning just before eagle commits
+      addPopup("EAGLE INCOMING!", "#ff6b3a");
+      sfx.eagle();
+    }
     if (p.idleT >= 5 && !game.eagle) {
-      // spawn eagle
+      // spawn eagle - target locks to current player position so a quick hop dodges
       game.eagle = { x: p.x+0.5, y: p.y - 6, t: 0, target: { x: p.x+0.5, y: p.y+0.5 }, phase:'dive', dur: 1.0 };
     }
     // also check getting too far behind camera (out of frame back)
